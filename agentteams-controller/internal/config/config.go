@@ -200,11 +200,11 @@ type Config struct {
 	CMSWorkspace      string
 	CMSServiceName    string
 
-	// RecoveryScanIntervalV is how often the leader-elected TeamHarness
+	// RecoveryScanIntervalRaw is how often the leader-elected TeamHarness
 	// recovery scanner (issue #1177) re-scans storage for submitted-but-
 	// not-yet-accepted tasks. Empty means the default (5 minutes).
 	// Sourced from AGENTTEAMS_RECOVERY_SCAN_INTERVAL, e.g. "10m".
-	RecoveryScanIntervalV string
+	RecoveryScanIntervalRaw string
 
 	// Pre-resolved worker environment defaults (passed to worker containers)
 	WorkerEnv WorkerEnvDefaults
@@ -441,7 +441,7 @@ func LoadConfig() *Config {
 
 	// Recovery scanner cadence (issue #1177). Not propagated to workers —
 	// only the Controller's leader-elected loop consumes it.
-	cfg.RecoveryScanIntervalV = os.Getenv("AGENTTEAMS_RECOVERY_SCAN_INTERVAL")
+	cfg.RecoveryScanIntervalRaw = os.Getenv("AGENTTEAMS_RECOVERY_SCAN_INTERVAL")
 
 	// In embedded mode, services (Tuwunel, MinIO) run inside the controller container.
 	// The controller itself uses 127.0.0.1, but child containers (Manager, Workers) must
@@ -494,7 +494,7 @@ func (c *Config) Namespace() string {
 // bounded by the wake record's MinInterval, so another controller restart
 // cannot flood the Leader with duplicate wakes.
 func (c *Config) RecoveryScanInterval() time.Duration {
-	raw := strings.TrimSpace(c.RecoveryScanIntervalV)
+	raw := strings.TrimSpace(c.RecoveryScanIntervalRaw)
 	if raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			return d

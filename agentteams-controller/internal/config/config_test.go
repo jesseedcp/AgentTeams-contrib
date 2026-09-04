@@ -321,11 +321,11 @@ func TestRecoveryScanIntervalParsing(t *testing.T) {
 	if got := cfg.RecoveryScanInterval(); got != defaultRecoveryScanInterval {
 		t.Fatalf("empty env: got %v, want %v", got, defaultRecoveryScanInterval)
 	}
-	cfg.RecoveryScanIntervalV = "not-a-duration"
+	cfg.RecoveryScanIntervalRaw = "not-a-duration"
 	if got := cfg.RecoveryScanInterval(); got != defaultRecoveryScanInterval {
 		t.Fatalf("invalid env: got %v, want %v", got, defaultRecoveryScanInterval)
 	}
-	cfg.RecoveryScanIntervalV = "90s"
+	cfg.RecoveryScanIntervalRaw = "90s"
 	if got := cfg.RecoveryScanInterval(); got != 90*time.Second {
 		t.Fatalf("parsed env: got %v, want 90s", got)
 	}

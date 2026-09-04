@@ -23,7 +23,6 @@ import (
 
 // recordingMatrix captures SendMessageContentAsAdmin calls.
 type recordingMatrix struct {
-	matrix.Client
 	calls int
 	sent  []struct {
 		RoomID        string
@@ -31,6 +30,21 @@ type recordingMatrix struct {
 		Content       map[string]interface{}
 	}
 	err error
+}
+
+type updateHookClient struct {
+	client.Client
+	afterUpdate func()
+}
+
+func (c *updateHookClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if err := c.Client.Update(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if c.afterUpdate != nil {
+		c.afterUpdate()
+	}
+	return nil
 }
 
 func (r *recordingMatrix) SendMessageContentAsAdmin(_ context.Context, roomID, transactionID string, content map[string]interface{}) (string, error) {
@@ -157,6 +171,116 @@ func TestDispatcherWakesSleepingLeaderBeforeSending(t *testing.T) {
 	}
 	if len(mtx.sent) != 1 {
 		t.Fatalf("sent %d messages, want 1", len(mtx.sent))
+	}
+}
+
+func TestDispatcherRechecksProjectFenceAfterWakingLeader(t *testing.T) {
+	ctx := context.Background()
+	mem := ossfake.NewMemory()
+	projectKey := "teams/biz/shared/projects/p-1/meta.json"
+	putProjectMeta(t, mem, projectKey, `{
+		"project_id": "p-1",
+		"team_id": "biz-team",
+		"tasks": [{"task_id": "t-1", "status": "submitted"}]
+	}`)
+	putPendingTaskMeta(t, mem, "teams/biz/shared/tasks/t-1/meta.json")
+
+	sleeping := "Sleeping"
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "biz-team", Namespace: "default"},
+		Status: v1beta1.TeamStatus{Members: []v1beta1.TeamMemberStatus{
+			{Name: "lead", Role: "team_leader", MatrixUserID: "@lead:matrix.local"},
+		}},
+	}
+	leader := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "lead", Namespace: "default"},
+		Spec:       v1beta1.WorkerSpec{State: &sleeping},
+	}
+	baseK8s := newTestK8sClient(t, team, leader)
+	k8s := &updateHookClient{
+		Client: baseK8s,
+		afterUpdate: func() {
+			// Simulate the normal acceptance path winning while the Controller
+			// wakes a sleeping Leader. ProjectMeta is committed before TaskMeta,
+			// so the task can still look pending at this point.
+			putProjectMeta(t, mem, projectKey, `{
+				"project_id": "p-1",
+				"team_id": "biz-team",
+				"tasks": [{"task_id": "t-1", "status": "completed"}]
+			}`)
+		},
+	}
+	mtx := &recordingMatrix{}
+	d := NewDispatcher(mem, mtx, k8s, "default")
+
+	err := d.SendRecoveryWake(ctx, recovery.WakeMessage{
+		ProjectID:    "p-1",
+		TaskID:       "t-1",
+		TeamPrefix:   "teams/biz/shared/",
+		RoomID:       "!task-room:matrix.local",
+		SubmissionID: "s-1",
+		DeliveryID:   "d-1",
+	})
+	if !errors.Is(err, recovery.ErrTaskDecided) {
+		t.Fatalf("SendRecoveryWake after concurrent accept: err=%v, want ErrTaskDecided", err)
+	}
+	if len(mtx.sent) != 0 {
+		t.Fatalf("sent %d messages after project became terminal, want 0", len(mtx.sent))
+	}
+}
+
+func TestDispatcherRechecksTaskFenceAfterWakingLeader(t *testing.T) {
+	ctx := context.Background()
+	mem := ossfake.NewMemory()
+	putProjectMeta(t, mem, "teams/biz/shared/projects/p-1/meta.json", `{
+		"project_id": "p-1",
+		"team_id": "biz-team",
+		"tasks": [{"task_id": "t-1", "status": "submitted"}]
+	}`)
+	taskKey := "teams/biz/shared/tasks/t-1/meta.json"
+	putPendingTaskMeta(t, mem, taskKey)
+
+	sleeping := "Sleeping"
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "biz-team", Namespace: "default"},
+		Status: v1beta1.TeamStatus{Members: []v1beta1.TeamMemberStatus{
+			{Name: "lead", Role: "team_leader", MatrixUserID: "@lead:matrix.local"},
+		}},
+	}
+	leader := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "lead", Namespace: "default"},
+		Spec:       v1beta1.WorkerSpec{State: &sleeping},
+	}
+	baseK8s := newTestK8sClient(t, team, leader)
+	k8s := &updateHookClient{
+		Client: baseK8s,
+		afterUpdate: func() {
+			putProjectMeta(t, mem, taskKey, `{
+				"project_id": "p-1",
+				"task_id": "t-1",
+				"status": "cancelled",
+				"submission_id": "s-1",
+				"room_id": "!task-room:matrix.local",
+				"continuation": {"status": "resolved", "delivery_id": "d-1", "resolution": "cancelled"}
+			}`)
+		},
+	}
+	mtx := &recordingMatrix{}
+	d := NewDispatcher(mem, mtx, k8s, "default")
+
+	err := d.SendRecoveryWake(ctx, recovery.WakeMessage{
+		ProjectID:    "p-1",
+		TaskID:       "t-1",
+		TeamPrefix:   "teams/biz/shared/",
+		RoomID:       "!task-room:matrix.local",
+		SubmissionID: "s-1",
+		DeliveryID:   "d-1",
+	})
+	if !errors.Is(err, recovery.ErrTaskDecided) {
+		t.Fatalf("SendRecoveryWake after concurrent cancel: err=%v, want ErrTaskDecided", err)
+	}
+	if len(mtx.sent) != 0 {
+		t.Fatalf("sent %d messages after task became terminal, want 0", len(mtx.sent))
 	}
 }
 

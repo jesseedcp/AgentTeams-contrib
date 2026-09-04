@@ -213,6 +213,26 @@ func TestDuplicateWakeThrottled(t *testing.T) {
 	}
 }
 
+func TestWakeRecordHashesOpaqueDeliveryIdentity(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStorager{objects: map[string][]byte{
+		"shared/tasks/t-1/meta.json": taskMeta("p-1", "t-1", "submitted", "opaque/submission:v1", "../opaque/delivery:v1"),
+	}}
+	notifier := &fakeNotifier{failOn: -1}
+	scanner := &Scanner{Storager: store, Notifier: notifier}
+
+	result := scanner.ScanOnce(ctx)
+	if len(result.Errors) != 0 || result.WakeSent != 1 {
+		t.Fatalf("ScanOnce result=%+v, want one successful wake", result)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("wake records=%v, want exactly one", store.puts)
+	}
+	if got, want := store.puts[0], "controller/recovery-wake/0aec42a722356d0535725ebeec474561cfb7f39d1abadc975b35004f1419a940.json"; got != want {
+		t.Fatalf("wake record key=%q, want %q", got, want)
+	}
+}
+
 func TestScanCoversTeamPrefix(t *testing.T) {
 	ctx := context.Background()
 	s := &fakeStorager{objects: map[string][]byte{

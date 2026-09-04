@@ -584,18 +584,6 @@ AND corresponding project/task node is not terminal
 Controller 或 channel 不得自行放宽这些条件，也不得重新定义 Task 状态映射。直到 PR2
 落地，pending marker 只是持久化事实，不会自动触发 Leader，也不能声称任务已恢复。
 
-**PR2 已实现**（Controller 侧 `internal/recovery`）：leader-elected 周期扫描
-`shared/tasks/` 与 `teams/{name}/shared/tasks/` 下的 TaskMeta，命中候选后通过
-Matrix admin 向 assignment room 发送 `TASK_COMPLETED` 契约行唤醒 Leader，再由
-Leader 走 `check_task -> accept_task_result` 显式验收。扫描器只唤醒，绝不自动
-accept；每个 submission 的唤醒受 15 分钟静默窗口约束，交付记录存于
-`controller/recovery-wake/`（Controller 自有前缀，不侵入 TaskMeta）；当前状态
-映射、fencing 与幂等语义仍由 TeamHarness 定义。
-
-Matrix 事务 ID 为 `teamharness-completion-{delivery_id}`。正常完成发送路径与恢复
-路径必须对同一次 submission 复用该事务 ID，这样 homeserver 已经接收消息、但发送方
-在记录回执前超时的情况，也只会形成一个 Matrix 事件。
-
 ## 现有实现差距
 
 当前 TeamHarness 已经具备轻量 project/task state 和 `create_quick_project`，但还没有

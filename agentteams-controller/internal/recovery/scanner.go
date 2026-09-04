@@ -20,6 +20,7 @@ package recovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -279,7 +280,11 @@ func (s *Scanner) wake(ctx context.Context, metaKey string, c Candidate, now tim
 	if interval <= 0 {
 		interval = DefaultWakeInterval
 	}
-	recordKey := wakeRecordPrefix + c.ProjectID + "/" + c.TaskID + "/" + c.SubmissionID + ".json"
+	// Neither identity is treated as a path component. delivery_id is the
+	// stable logical delivery identity; hashing its raw bytes gives the
+	// controller a deterministic, path-safe object name even when it reads a
+	// malformed legacy value.
+	recordKey := wakeRecordKey(c.Continuation.DeliveryID)
 
 	var rec wakeRecord
 	if data, err := s.Storager.GetObject(ctx, recordKey); err == nil {
@@ -322,10 +327,16 @@ func (s *Scanner) wake(ctx context.Context, metaKey string, c Candidate, now tim
 	return true, nil
 }
 
-// wakeRecordPrefix is where the controller records emitted recovery wakes.
-// It is deliberately NOT under TaskMeta: the controller owns this bookkeeping
-// and TeamHarness keeps owning task state.
+// wakeRecordPrefix is where the controller records emitted recovery wakes,
+// keyed by a hash of the canonical delivery_id. It is deliberately NOT under
+// TaskMeta: the controller owns this bookkeeping and TeamHarness keeps owning
+// task state.
 const wakeRecordPrefix = "controller/recovery-wake/"
+
+func wakeRecordKey(deliveryID string) string {
+	sum := sha256.Sum256([]byte(deliveryID))
+	return wakeRecordPrefix + fmt.Sprintf("%x", sum) + ".json"
+}
 
 type wakeRecord struct {
 	ProjectID    string    `json:"project_id"`

@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
-	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/recovery"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -17,39 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// projectMetaTTaskLite is the subset of ProjectMeta needed to resolve a task's
-// owning team and fence terminal project/task state. Mirrors projectMeta but
-// is declared locally so the recovery dispatcher stays independent of HTTP
-// handler additions.
-type projectMetaTTaskLite struct {
-	ProjectID string            `json:"project_id"`
-	TeamID    string            `json:"team_id"`
-	Status    string            `json:"status,omitempty"`
-	Tasks     []projectNodeLite `json:"tasks,omitempty"`
-	Loop      *struct {
-		Tasks []projectNodeLite `json:"tasks,omitempty"`
-	} `json:"loop,omitempty"`
-}
-
-// projectNodeLite is one project DAG node.
-type projectNodeLite struct {
-	TaskID string `json:"task_id,omitempty"`
-	Status string `json:"status,omitempty"`
-}
-
-// terminalNodeStatuses are the node statuses after which a submission must
-// never be re-woken. Mirrors TeamHarness's accept/cancel decisions; the
-// dispatcher only closes on statuses the harness persists.
-var terminalNodeStatuses = map[string]bool{
-	"completed": true,
-	"revision":  true,
-	"blocked":   true,
-	"cancelled": true,
-}
-
-var terminalProjectStatuses = map[string]bool{
-	"completed": true,
-	"blocked":   true,
+type recoveryMatrixSender interface {
+	SendMessageContentAsAdmin(ctx context.Context, roomID, transactionID string, content map[string]interface{}) (string, error)
 }
 
 // Dispatcher resolves the Leader for recovered submissions and sends the
@@ -59,14 +27,14 @@ var terminalProjectStatuses = map[string]bool{
 // line (Matrix admin send).
 type Dispatcher struct {
 	OSS    oss.StorageClient
-	Matrix matrix.Client
+	Matrix recoveryMatrixSender
 	K8s    client.Client
 	NS     string
 }
 
 // NewDispatcher wires a recovery.Notifier against the Controller's
 // storage/Matrix/Kubernetes clients.
-func NewDispatcher(o oss.StorageClient, m matrix.Client, k client.Client, ns string) *Dispatcher {
+func NewDispatcher(o oss.StorageClient, m recoveryMatrixSender, k client.Client, ns string) *Dispatcher {
 	return &Dispatcher{OSS: o, Matrix: m, K8s: k, NS: ns}
 }
 
@@ -98,6 +66,25 @@ func (d *Dispatcher) SendRecoveryWake(ctx context.Context, wake recovery.WakeMes
 	if err := d.ensureLeaderRunning(ctx, leader.Name); err != nil {
 		return err
 	}
+	// Waking a sleeping Leader crosses a Kubernetes write boundary. The
+	// normal acceptance/cancellation path may win while that update is in
+	// flight, so fence both canonical files again immediately before the
+	// Matrix send. ProjectMeta is checked separately because TeamHarness
+	// commits the project decision before repairing TaskMeta.
+	stillPending, err = d.taskStillPending(ctx, wake)
+	if err != nil {
+		return err
+	}
+	if !stillPending {
+		return recovery.ErrTaskDecided
+	}
+	project, err := d.readProjectMeta(ctx, wake.ProjectID, wake.TeamPrefix)
+	if err != nil {
+		return err
+	}
+	if project == nil || projectNodeTerminal(project, wake.TaskID) {
+		return recovery.ErrTaskDecided
+	}
 	body := recovery.CompletionBody(leader.MatrixUserID, wake)
 	content := map[string]interface{}{
 		"msgtype": "m.text",
@@ -112,9 +99,10 @@ func (d *Dispatcher) SendRecoveryWake(ctx context.Context, wake recovery.WakeMes
 			"user_ids": []string{leader.MatrixUserID},
 		}
 	}
-	// Name the transaction after the logical completion, not this recovery
-	// attempt. A normal sender can use the same delivery_id so a timeout and
-	// Controller retry collapse to one Matrix event.
+	// Name the transaction after the logical recovery delivery, not this scan
+	// attempt. Controller retries reuse it and collapse to one Matrix event.
+	// The normal Worker notification uses a different Matrix identity, so the
+	// two paths remain intentionally at-least-once and may both wake the Leader.
 	transactionID := "teamharness-completion-" + wake.DeliveryID
 	if _, err := d.Matrix.SendMessageContentAsAdmin(ctx, roomID, transactionID, content); err != nil {
 		return fmt.Errorf("send recovery wake to %s: %w", roomID, err)
@@ -145,8 +133,8 @@ func (d *Dispatcher) taskStillPending(ctx context.Context, wake recovery.WakeMes
 
 // projectNodeTerminal reports whether the project or its matching task node
 // has already reached a terminal decision. A missing node also fails closed.
-func projectNodeTerminal(project *projectMetaTTaskLite, taskID string) bool {
-	if terminalProjectStatuses[project.Status] {
+func projectNodeTerminal(project *projectMeta, taskID string) bool {
+	if project.Status == "completed" || project.Status == "blocked" {
 		return true
 	}
 	tasks := project.Tasks
@@ -155,7 +143,7 @@ func projectNodeTerminal(project *projectMetaTTaskLite, taskID string) bool {
 	}
 	for _, t := range tasks {
 		if t.TaskID == taskID {
-			return terminalNodeStatuses[t.Status]
+			return isTerminalTaskStatus(t.Status)
 		}
 	}
 	// Eligibility requires a matching non-terminal project node. Absence is
@@ -257,7 +245,7 @@ func (d *Dispatcher) ensureLeaderRunning(ctx context.Context, name string) error
 // under the global prefix or a team-scoped prefix; the task's storage scope
 // picks which one to read so a team project never silently falls back to a
 // global project with the same id.
-func (d *Dispatcher) readProjectMeta(ctx context.Context, projectID, teamPrefix string) (*projectMetaTTaskLite, error) {
+func (d *Dispatcher) readProjectMeta(ctx context.Context, projectID, teamPrefix string) (*projectMeta, error) {
 	if projectID == "" {
 		return nil, nil
 	}
@@ -272,7 +260,7 @@ func (d *Dispatcher) readProjectMeta(ctx context.Context, projectID, teamPrefix 
 		}
 		return nil, fmt.Errorf("read project meta %s: %w", key, err)
 	}
-	var meta projectMetaTTaskLite
+	var meta projectMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("decode project meta %s: %w", key, err)
 	}
