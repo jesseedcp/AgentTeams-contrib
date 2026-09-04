@@ -77,6 +77,12 @@ type Client interface {
 	// cached, then delegates to SendMessage.
 	SendMessageAsAdmin(ctx context.Context, roomID, body string) error
 
+	// SendMessageContentAsAdmin sends a raw Matrix event content object
+	// (e.g. with "m.mentions") as the admin identity. transactionID must be
+	// stable for retries of the same logical message. Content must include
+	// "msgtype". The returned event ID is the homeserver receipt.
+	SendMessageContentAsAdmin(ctx context.Context, roomID, transactionID string, content map[string]interface{}) (string, error)
+
 	// Login obtains an access token for an existing user.
 	Login(ctx context.Context, username, password string) (string, error)
 
@@ -849,6 +855,41 @@ func (c *TuwunelClient) SendMessageAsAdmin(ctx context.Context, roomID, body str
 		return fmt.Errorf("send admin message: %w", err)
 	}
 	return nil
+}
+
+// SendMessageContentAsAdmin sends a raw event content object as the admin
+// identity. Unlike SendMessageAsAdmin it supports structured fields such as
+// "m.mentions", which the appservice mention dispatch requires to wake a
+// sleeping Team Leader.
+func (c *TuwunelClient) SendMessageContentAsAdmin(ctx context.Context, roomID, transactionID string, content map[string]interface{}) (string, error) {
+	if _, ok := content["msgtype"]; !ok {
+		return "", fmt.Errorf("send admin message content: msgtype is required")
+	}
+	transactionID = strings.TrimSpace(transactionID)
+	if transactionID == "" {
+		return "", fmt.Errorf("send admin message content: transactionID is required")
+	}
+	token, err := c.ensureAdminToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("send admin message content: %w", err)
+	}
+	encodedRoom := encodeRoomID(roomID)
+	var response struct {
+		EventID string `json:"event_id"`
+	}
+	statusCode, respBody, err := c.doJSON(ctx, http.MethodPut,
+		fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s", encodedRoom, url.PathEscape(transactionID)),
+		token, content, &response)
+	if err != nil {
+		return "", fmt.Errorf("send admin message content to %s: %w", roomID, err)
+	}
+	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+		return "", fmt.Errorf("send admin message content to %s: HTTP %d: %s", roomID, statusCode, truncate(respBody, 500))
+	}
+	if strings.TrimSpace(response.EventID) == "" {
+		return "", fmt.Errorf("send admin message content to %s: empty event_id", roomID)
+	}
+	return response.EventID, nil
 }
 
 // AdminCommand sends a command message to the Tuwunel admin bot room as

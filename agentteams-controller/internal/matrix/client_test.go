@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1050,5 +1051,106 @@ func TestGeneratePassword(t *testing.T) {
 	p2, _ := GeneratePassword(16)
 	if p1 == p2 {
 		t.Error("two generated passwords should not be equal")
+	}
+}
+
+func TestSendMessageContentAsAdminWithMentions(t *testing.T) {
+	var gotBody map[string]interface{}
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_matrix/client/v3/login":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"access_token": "admin-token"})
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			gotPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"event_id":"$evt"}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL:     server.URL,
+		Domain:        "test.domain",
+		AdminUser:     "admin",
+		AdminPassword: "adminpw",
+	}, server.Client())
+
+	content := map[string]interface{}{
+		"msgtype": "m.text",
+		"body":    "@lead:test.domain TASK_COMPLETED: t-1 - Result: shared/tasks/t-1/result.md",
+		"m.mentions": map[string]interface{}{
+			"user_ids": []string{"@lead:test.domain"},
+		},
+	}
+	eventID, err := c.SendMessageContentAsAdmin(context.Background(), "!room:test.domain", "teamharness-completion-d-1", content)
+	if err != nil {
+		t.Fatalf("SendMessageContentAsAdmin: %v", err)
+	}
+	if eventID != "$evt" {
+		t.Fatalf("event ID=%q, want $evt", eventID)
+	}
+	if gotPath == "" {
+		t.Fatal("no PUT to send/m.room.message")
+	}
+	if !strings.HasSuffix(gotPath, "/teamharness-completion-d-1") {
+		t.Fatalf("path=%q, want stable recovery transaction id", gotPath)
+	}
+	if b, _ := gotBody["body"].(string); b == "" {
+		t.Errorf("body missing: %v", gotBody)
+	}
+	mentions, ok := gotBody["m.mentions"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("m.mentions missing: %v", gotBody)
+	}
+	ids, _ := mentions["user_ids"].([]interface{})
+	if len(ids) != 1 || ids[0] != "@lead:test.domain" {
+		t.Errorf("m.mentions.user_ids = %v, want [@lead:test.domain]", ids)
+	}
+}
+
+func TestSendMessageContentAsAdminRequiresMsgtype(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	c := NewTuwunelClient(Config{
+		ServerURL:     server.URL,
+		Domain:        "test.domain",
+		AdminUser:     "admin",
+		AdminPassword: "adminpw",
+	}, server.Client())
+
+	_, err := c.SendMessageContentAsAdmin(context.Background(), "!room:test.domain", "txn-1", map[string]interface{}{"body": "no msgtype"})
+	if err == nil || !strings.Contains(err.Error(), "msgtype") {
+		t.Fatalf("expected msgtype error, got %v", err)
+	}
+}
+
+func TestSendMessageContentAsAdminRequiresStableTransactionID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	c := NewTuwunelClient(Config{
+		ServerURL:     server.URL,
+		Domain:        "test.domain",
+		AdminUser:     "admin",
+		AdminPassword: "adminpw",
+	}, server.Client())
+
+	_, err := c.SendMessageContentAsAdmin(context.Background(), "!room:test.domain", "", map[string]interface{}{
+		"msgtype": "m.text",
+		"body":    "wake",
+	})
+	if err == nil || !strings.Contains(err.Error(), "transactionID") {
+		t.Fatalf("expected transactionID error, got %v", err)
 	}
 }

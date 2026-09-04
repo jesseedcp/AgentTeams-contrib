@@ -24,6 +24,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
 	agentteamsmetrics "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/metrics"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/recovery"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/remoteclient"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/server"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
@@ -90,6 +91,10 @@ type App struct {
 	deployer      *service.Deployer
 	envBuilder    *service.WorkerEnvBuilder
 	managerConfig *service.ManagerConfigStore
+
+	// recoveryScanner re-wakes TeamHarness Leaders for submitted-but-
+	// not-yet-accepted tasks (#1177). Only the elected Controller runs it.
+	recoveryScanner *recovery.Scanner
 }
 
 // New constructs the entire application dependency graph and wires everything
@@ -246,6 +251,15 @@ func (a *App) Start(ctx context.Context) error {
 			"kubeMode", a.cfg.KubeMode,
 			"httpAddr", a.cfg.HTTPAddr,
 		)
+
+		// Leader-elected recovery scanner (#1177): re-wake TeamHarness
+		// Leaders for submissions that never reached them. Runs only on the
+		// elected Controller so two replicas never double-scan.
+		if a.recoveryScanner != nil {
+			a.wg.Go(func() {
+				a.recoveryScanner.Run(ctx, a.cfg.RecoveryScanInterval())
+			})
+		}
 	})
 
 	return a.mgr.Start(ctx)
@@ -654,6 +668,11 @@ func (a *App) initHTTPServer(_ context.Context) error {
 
 		DefaultWorkerRuntime: a.cfg.DefaultWorkerRuntime,
 	})
+	a.recoveryScanner = &recovery.Scanner{
+		Storager: a.oss,
+		Notifier: server.NewDispatcher(a.oss, a.matrix, a.mgr.GetClient(), a.namespace),
+		Logger:   ctrl.Log.WithName("recovery"),
+	}
 	return nil
 }
 

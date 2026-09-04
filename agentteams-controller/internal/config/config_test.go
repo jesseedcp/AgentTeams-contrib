@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -311,5 +312,21 @@ func TestLoadConfigAutoPrefixDisabledKeepsExplicitContainerPrefix(t *testing.T) 
 
 	if cfg.ContainerPrefix != "custom-worker-" {
 		t.Fatalf("ContainerPrefix = %q, want %q", cfg.ContainerPrefix, "custom-worker-")
+	}
+}
+
+func TestRecoveryScanIntervalParsing(t *testing.T) {
+	// Empty / invalid env falls back to the default.
+	cfg := &Config{}
+	if got := cfg.RecoveryScanInterval(); got != defaultRecoveryScanInterval {
+		t.Fatalf("empty env: got %v, want %v", got, defaultRecoveryScanInterval)
+	}
+	cfg.RecoveryScanIntervalV = "not-a-duration"
+	if got := cfg.RecoveryScanInterval(); got != defaultRecoveryScanInterval {
+		t.Fatalf("invalid env: got %v, want %v", got, defaultRecoveryScanInterval)
+	}
+	cfg.RecoveryScanIntervalV = "90s"
+	if got := cfg.RecoveryScanInterval(); got != 90*time.Second {
+		t.Fatalf("parsed env: got %v, want 90s", got)
 	}
 }
